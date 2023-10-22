@@ -2,8 +2,9 @@ import os
 from torch.utils import data
 from torch.utils.data.sampler import SubsetRandomSampler, SequentialSampler
 from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import autocast
 import torch.nn as nn
+import torch.nn.functional as F
 from datetime import datetime
 import argparse
 import math
@@ -14,45 +15,44 @@ from nets.SLNet import SLNet
 from utils.STORMDataset import STORMDatasetFull
 from utils.misc_utils import *
 
-main_folder = "/STORM"
-runs_dir = "/STORM/runs"
-data_dir = "/STORM/Datasets"
+main_folder = "."
+runs_dir = f'{main_folder}/runs/'
 
 dataset_paths = {
-    'storm_train': f'{data_dir}/DeepSTORM_dataset',
-    'storm_test': f'{data_dir}/DeepSTORM_dataset',
+    'storm_train': f'{main_folder}/DeepSTORM dataset_v1/BIN4_glia_actin_2D.tif',
 }
+dataset_paths['storm_test'] = dataset_paths['storm_train'] 
 
 dataset_to_use = 'storm_train'
 dataset_to_use_test = 'storm_test'
 
 # Arguments
 parser = argparse.ArgumentParser()
-parser.add_argument('--data_folder', nargs='?', default=dataset_paths[dataset_to_use],
+parser.add_argument('--data_path', nargs='?', default=dataset_paths[dataset_to_use],
                     help='Input training images path in format /STORM_image/STORM_image_stack.tif and '
                          'STORM_image_stack_S.tif in case of a sparse GT stack.')
-parser.add_argument('--data_folder_test', nargs='?', default=dataset_paths[dataset_to_use_test],
+parser.add_argument('--data_path_test', nargs='?', default=dataset_paths[dataset_to_use_test],
                     help='Input testing image path')
 
 parser.add_argument('--files_to_store', nargs='+', default=[],
                     help='Relative paths of files to store in a zip when running this script, for backup.')
-parser.add_argument('--prefix', nargs='?', default="STORM", help='Prefix string for the output folder.')
+parser.add_argument('--posfix', nargs='?', default="SLNET", help='Posfix string for the output folder.')
 parser.add_argument('--checkpoint', nargs='?', default="", help='File path of checkpoint of previous run.')
 # Images related arguments
 parser.add_argument('--images_to_use', nargs='+', type=int, default=list(range(0, 100, 1)),
                     help='Indexes of images to train on.')
-parser.add_argument('--images_to_use_test', nargs='+', type=int, default=list(range(101, 7000, 1)),
+parser.add_argument('--images_to_use_test', nargs='+', type=int, default=list(range(101, 110, 1)),
                     help='Indexes of images to test on.')
 parser.add_argument('--img_size', type=int, default=256, help='Side size of input image; square preferred.')
 # Training arguments
 parser.add_argument('--batch_size', type=int, default=8, help='Training batch size.')
 parser.add_argument('--learning_rate', type=float, default=0.0001, help='Training learning rate.')
-parser.add_argument('--max_epochs', type=int, default=101, help='Training epochs to run.')
+parser.add_argument('--max_epochs', type=int, default=501, help='Training epochs to run.')
 parser.add_argument('--validation_split', type=float, default=0.1, help='Which part to use for validation 0 to 1.')
 parser.add_argument('--eval_every', type=int, default=10, help='How often to evaluate the testing/validation set.')
 parser.add_argument('--shuffle_dataset', type=int, default=1, help='Randomize training images 0 or 1')
 parser.add_argument('--use_bias', type=int, default=0, help='Use bias during training? 0 or 1')
-parser.add_argument('--plot_images', type=int, default=1, help='Plot results with matplotlib?')
+parser.add_argument('--plot_images', type=int, default=0, help='Plot results with matplotlib?')
 # Noise arguments
 parser.add_argument('--add_noise', type=int, default=0, help='Apply noise to images? 0 or 1')
 parser.add_argument('--signal_power_max', type=float, default=30 ** 2,
@@ -79,16 +79,13 @@ parser.add_argument('--use_random_shifts', nargs='+', type=int, default=0,
 parser.add_argument('--frame_to_grab', type=int, default=0, help='Which frame to show from the sparse decomposition?')
 parser.add_argument('--l0_ths', type=float, default=0.05, help='Threshold value for alpha in nuclear decomposition')
 # misc arguments
-parser.add_argument('--output_path', nargs='?', default=runs_dir + '/camera_ready_github/')
+parser.add_argument('--output_path', nargs='?', default=runs_dir)
 parser.add_argument('--main_gpu', nargs='+', type=int, default=[], help='List of GPUs to use: [0,1]')
 
 n_threads = 0
 args = parser.parse_args()
-if len(args.main_gpu) > 0:
-    device = "cuda:" + str(args.main_gpu[0])
-else:
-    device = "cuda"
-    args.main_gpu = [0]
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 if n_threads != 0:
     torch.set_num_threads(n_threads)
@@ -104,27 +101,24 @@ if len(args.checkpoint) > 0:
     args.dark_current = currArgs.dark_current
     args.learning_rate = currArgs.learning_rate
     args.batch_size = currArgs.batch_size
-    args.data_folder_test = currArgs.data_folder_test
+    args.data_path_test = currArgs.data_path_test
     args.dark_current_sparse = currArgs.dark_current_sparse
 args.shuffle_dataset = bool(args.shuffle_dataset)
 
 # Get commit number
 # label = subprocess.check_output(["git", "describe", "--always"]).strip()
-save_folder = args.output_path + datetime.now().strftime('%Y_%m_%d__%H:%M:%S') + str(
-    args.main_gpu[0]) + "_gpu__" + args.prefix
+save_folder = f"{args.output_path}{datetime.now().strftime('%Y_%m_%d__%H:%M:%S')}_{args.posfix}"
 
 print(f'Logging dir: {save_folder}')
 
 # Load datasets
 args.output_shape = 2 * 512
-dataset = STORMDatasetFull(args.data_folder, img_shape=2 * [args.img_size], images_to_use=args.images_to_use,
-                           load_sparse=False, temporal_shifts=args.temporal_shifts,
-                           use_random_shifts=args.use_random_shifts)
+dataset = STORMDatasetFull(args.data_path, img_shape=2 * [args.img_size], images_to_use=args.images_to_use,
+                           temporal_shifts=args.temporal_shifts, use_random_shifts=args.use_random_shifts)
 
-dataset_test = STORMDatasetFull(args.data_folder_test, img_shape=2 * [args.img_size],
-                                images_to_use=args.images_to_use_test, load_sparse=False)
+dataset_test = STORMDatasetFull(args.data_path_test, img_shape=2 * [args.img_size], images_to_use=args.images_to_use_test)
 
-os.mkdir(save_folder)
+os.makedirs(save_folder, exist_ok=True)
 
 # Perform the median subtraction background removal for the train and test dataset
 sparse_part_median = F.relu(
@@ -203,9 +197,6 @@ params = sum([np.prod(p.size()) for p in net.parameters()])
 # Create optimizer
 optimizer = torch.optim.Adam(trainable_params, lr=args.learning_rate)
 
-# create gradient scaler for mixed precision training
-scaler = GradScaler()
-
 # Is there a checkpoint? load it
 start_epoch = 0
 if checkpoint_path:
@@ -227,10 +218,6 @@ for ff in args.files_to_store:
     zf.write(ff)
 zf.close()
 
-# timers
-start = torch.cuda.Event(enable_timing=True)
-end = torch.cuda.Event(enable_timing=True)
-
 # Loop over epochs
 for epoch in range(start_epoch, args.max_epochs):
     for curr_train_stage in ['train', 'val', 'test']:
@@ -251,7 +238,6 @@ for epoch in range(start_epoch, args.max_epochs):
         # Store losses of current epoch
         mean_loss = 0
         mean_psnr = 0
-        mean_time = 0
         mean_eigen_values = torch.zeros([args.n_frames])
         mean_eigen_values_cropped = torch.zeros([args.n_frames])
         mean_eigen_crop = 0
@@ -282,19 +268,8 @@ for epoch in range(start_epoch, args.max_epochs):
                 optimizer.zero_grad()
 
             with autocast():
-                torch.cuda.synchronize()
-                start.record()
                 # Predict dense part with the network
-                dense_part = F.relu(net(curr_img_stack))
-
-                # Compute sparse part
-                sparse_part = F.relu(curr_img_stack - dense_part)
-
-                # Measure time
-                end.record()
-                torch.cuda.synchronize()
-                end_time = start.elapsed_time(end) / curr_img_stack.shape[0]
-                mean_time += end_time
+                dense_part, sparse_part = net.forward_train(curr_img_stack)
 
                 # Compute sparse decomposition on a patch, as the full image doesn't fit in memory due to SVD
                 center = 64
@@ -387,14 +362,13 @@ for epoch in range(start_epoch, args.max_epochs):
         # Compute different performance metrics
         mean_loss /= curr_loader_len
         mean_psnr = 20 * torch.log10(max_images / torch.sqrt(torch.tensor(mean_loss)))
-        mean_time /= curr_loader_len
 
         if epoch % args.eval_every == 0:
             # Create debug images
             M = curr_img_stack[:, args.frame_to_grab, ...].unsqueeze(1)
             S_SLNet = sparse_part[:, args.frame_to_grab, ...].unsqueeze(1)
             L_SLNet = dense_part[:, args.frame_to_grab, ...].unsqueeze(1)
-            Rank_SLNet = torch.matrix_rank(L_SLNet[0, 0, ...].float()).item()
+            Rank_SLNet = torch.linalg.matrix_rank(L_SLNet[0, 0, ...].float()).item()
 
             fro_M = torch.norm(M).item()
             fro_SLNet = torch.norm(M - L_SLNet - S_SLNet).item()
@@ -433,7 +407,6 @@ for epoch in range(start_epoch, args.max_epochs):
             writer.add_scalar('regularization_weights/mu_sum_constraint', net.mu_sum_constraint.item(), epoch)
             writer.add_scalar('regularization_weights/eigen_crop_percentage', mean_eigen_crop, epoch)
             writer.add_scalar('psnr/' + curr_train_stage, mean_psnr, epoch)
-            writer.add_scalar('times/' + curr_train_stage, mean_time, epoch)
             writer.add_scalar('lr/' + curr_train_stage, args.learning_rate, epoch)
 
             # writer.add_histogram('eigenvalues/'+curr_train_stage, mean_eigen_values, epoch)
@@ -443,7 +416,7 @@ for epoch in range(start_epoch, args.max_epochs):
                 writer.add_scalar('metrics/' + k + '_' + curr_train_stage, v[-1], epoch)
 
         print(str(epoch) + ' ' + curr_train_stage + " loss: " + str(mean_loss) + " eigenCrop: " + str(
-            mean_eigen_crop) + " time: " + str(mean_time))  # , end="\r")
+            mean_eigen_crop) )  # , end="\r")
 
         if epoch % 25 == 0:
             torch.save({
@@ -452,7 +425,6 @@ for epoch in range(start_epoch, args.max_epochs):
                 'statistics': [mean_imgs, std_images],
                 'model_state_dict': net.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'scaler_state_dict': scaler.state_dict(),
                 'loss': mean_loss},
                 save_folder + '/model_' + str(epoch))
 
@@ -468,10 +440,7 @@ for epoch in range(start_epoch, args.max_epochs):
 
                         with autocast():
                             # Predict dense part with the network
-                            dense_part = F.relu(net(curr_img_stack))
-
-                            # Compute sparse part
-                            sparse_part = F.relu(curr_img_stack - dense_part)
+                            dense_part, sparse_part = net.forward_train(curr_img_stack)
 
                             # de-normalization
                             sparse_part = normalize_type(sparse_part, args.norm_type, mean_imgs, std_images,
@@ -480,3 +449,96 @@ for epoch in range(start_epoch, args.max_epochs):
                             output_sparse_images[ix, ...] = sparse_part[0, 0,].detach().cpu()
                     save_image(output_sparse_images.permute(1, 0, 2, 3),
                                f'{save_folder}/Sparse_{curr_train_stage}_ep_{epoch}.tif')
+
+inn = torch.ones((1,3,100,100))
+for i in range(inn.shape[1]):
+    inn[0,i] *= i
+s = net.forward(inn)
+
+import os
+import hashlib
+
+# the imports for bioimage.io model export
+import bioimageio.core
+import numpy as np
+import torch
+import torch.nn as nn
+from bioimageio.core.build_spec import build_model, add_weights
+
+
+model_root = "my-model"
+output_path = f"{model_root}/model.zip"
+os.makedirs(model_root, exist_ok=True)
+model = torch.jit.script(net)
+
+# save the model weights
+model.save(f"{model_root}/weights.pt")
+
+input_ = data_loaders['train'].dataset.stacked_views[:3,...].permute(1,2,0).unsqueeze(0).unsqueeze(0).numpy().astype(np.float32)
+s = net.forward(torch.from_numpy(input_))
+with torch.no_grad():
+    output = model(torch.from_numpy(input_)).numpy()
+np.save(f"{model_root}/test-input.npy", input_)
+np.save(f"{model_root}/test-output.npy", output)
+
+## Create documentation
+with open(f"{model_root}/doc.md", "w") as f:
+    f.write("# SLNet sparse decomposition model\n")
+    f.write(f"This model was trained on {len(args.images_to_use)} images of glia cells.\n")
+# now we can use the build_model function to create the zipped package.
+
+
+
+
+model_resource = build_model(
+    pytorch_version=torch.__version__,
+    # the weight file and the type of the weights
+    weight_uri=f"{model_root}/weights.pt",
+    weight_type="torchscript",
+    # the test input and output data as well as the description of the tensors
+    # these are passed as list because we support multiple inputs / outputs per model
+    test_inputs=[f"{model_root}/test-input.npy"],
+    test_outputs=[f"{model_root}/test-output.npy"],
+    # input_min_shape=[1,1,1,1,3],
+    # input_step=[1,1,1,1,1],
+    input_axes=["bcxyz"],
+    output_axes=["bcxyz"],
+    # where to save the model zip, how to call the model and a short description of it
+    output_path=output_path,
+    name=f"SLNet_STORM_{args.max_epochs*len(args.images_to_use)}_it",
+    description="an SLNet model trained to extract the sparse component of a set of 3 images.",
+    # additional metadata about authors, licenses, citation etc.
+    authors=[{"name": "Patris Valera, Josue Page Vizcaino"}],
+    license="CC-BY-4.0",
+    documentation=f"{model_root}/doc.md",
+    tags=['fluorescence-light-microscopy', '2d', 'pytorch', 'storm', 'sparse-imaging', 'imagej', 'fiji', 'deepimagej', 'background-removal'],  # the tags are used to make models more findable on the website
+    cite=[{"text": "Gizmo et al.", "doi": "doi:10.1002/xyzacab123"}],
+    add_deepimagej_config=True
+)
+
+# finally, we test that the expected outptus are reproduced when running the model.
+# the 'test_model' function runs this test.
+# it will output a list of dictionaries. each dict gives the status of a different test that is being run
+# if all of them contain "status": "passed" then all tests were successful
+from bioimageio.core.resource_tests import test_model
+my_model = bioimageio.core.load_resource_description(output_path) 
+test_model(my_model)
+print('successfully')
+
+
+
+# Add the new torchsript weights in the rdf.yaml, in addition to the original pytorch_state_dict
+# Note: this will only work if the weights are added in the order presented here:
+    # 1. build_model with the pytorch_state_dict (original)
+    # 2. add_weights with the torchscript weights (new)
+    # possible reason: cache has the info of original weights only
+
+final_zip_path = f"{model_root}/new_model_added_weigths.zip"
+
+_=add_weights(
+    model=output_path,
+    output_path=final_zip_path,
+    weight_uri=f"{model_root}/weights.pt",
+    weight_type="torchscript",
+    pytorch_version = torch.__version__
+    )

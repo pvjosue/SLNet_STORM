@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -103,8 +104,30 @@ class SLNet(nn.Module):
         self.conv1 = nn.Conv2d(n_temporal_frames, n_temporal_frames * 2, 1, 1, 0, bias=use_bias)
         self.conv2 = nn.Conv2d(n_temporal_frames * 2, n_temporal_frames * 1, 1, 1, 0, bias=use_bias)
 
-    def forward(self, input):
+    def forward_train(self, input):
         x = (self.conv1(input))
         x = self.relu(self.conv2(x))
 
-        return x
+        return x,F.relu(input-x)
+    
+    # Process when a huge input is encountered, by appending images in the channel dimension as b,3,w,h
+    def forward(self, input):
+        is3D = False
+        if input.shape[1] == 3:
+            result = self.forward_train(input)
+            return result[1]
+        # Else, it's a 3D input from deepij
+        # Move z dimension into channel dimension
+        input = input[0].permute(3,0,1,2)
+        # Arrange in batches
+        input = input.view(-1, 3, input.shape[2], input.shape[3])
+        x = (self.conv1(input))
+        dense_part = self.relu(self.conv2(x))
+        # Compute sparse part
+        sparse_part = F.relu(input - dense_part)
+        
+        # Re-arrange into 3D tensor
+        output = sparse_part.view(-1, sparse_part.shape[-2], sparse_part.shape[-1]).unsqueeze(0).unsqueeze(0).permute(0,1,3,4,2)
+
+        return output
+
